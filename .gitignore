@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# 测试产物
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# 运行产物(本地 workspace/logs)
+ws/
+workspace/
+logs/
+*.log
+
+# 环境
+.venv/
+venv/
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
