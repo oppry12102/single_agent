@@ -10,6 +10,7 @@ import pytest
 
 from single_agent import (
     AgentConfig,
+    LLMAdapter,
     LLMResult,
     Memory,
     SingleAgent,
@@ -418,3 +419,104 @@ def test_close_cleans_up_inflight(cfg, scripted_llm):
             await asyncio.sleep(0.01)  # 让它跑起来
 
     asyncio.run(main())  # 不应抛错
+
+
+# ============================================================
+# 回归: 短任务在长任务的工具执行间隙穿插(bug: 长任务全程持有 LLM sem)
+# ============================================================
+
+
+class _SleepTool(Tool):
+    name = "sleep_tool"
+    spec = {
+        "type": "function",
+        "function": {
+            "name": "sleep_tool",
+            "description": "sleep 0.3s",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }
+
+    async def run(self, args, ctx):
+        await asyncio.sleep(0.3)
+        return {"ok": True}
+
+
+class _RouteLLM(LLMAdapter):
+    """LONG 的第一轮调 sleep_tool(制造工具执行间隙);其余一律 done。"""
+
+    def __init__(self):
+        super().__init__(provider="")
+
+    async def chat_with_tools(self, messages, *, tools=None, **kw):
+        user = messages[1]["content"]
+        if user == "LONG" and not any(m["role"] == "tool" for m in messages):
+            return LLMResult(content="", tool_calls=[ToolCall("1", "sleep_tool", {})])
+        return LLMResult(content="", tool_calls=[
+            ToolCall("2", "done", {"answer": f"ans-{user}"}),
+        ])
+
+
+def test_short_task_interleaves_with_long(cfg):
+    async def main():
+        agent = SingleAgent(cfg, llm=_RouteLLM())
+        agent.register_tool(_SleepTool())
+        done_events: list[dict] = []
+
+        async def cb(ev):
+            done_events.append(ev)
+
+        agent.on_event(cb)
+        async with agent:
+            await agent.submit("LONG", kind="long")
+            await asyncio.sleep(0.1)  # 让 LONG 先进入 sleep_tool 执行阶段
+            await agent.submit("SHORT", kind="short")
+            for _ in range(200):
+                if len(done_events) >= 2:
+                    break
+                await asyncio.sleep(0.02)
+        return [ev["answer"] for ev in done_events]
+
+    answers = asyncio.run(main())
+    # 旧实现长任务全程持有 LLM sem,SHORT 会排在 LONG 后完成
+    assert answers == ["ans-SHORT", "ans-LONG"]
+
+
+# ============================================================
+# 回归: close 后重启,queue / event_logger 必须恢复(bug: _stop 不重置)
+# ============================================================
+
+
+def test_agent_restart_after_close(cfg, scripted_llm):
+    scripted_llm.queue(
+        LLMResult(content="", tool_calls=[ToolCall("1", "done", {"answer": "a1"})]),
+        LLMResult(content="", tool_calls=[ToolCall("2", "done", {"answer": "a2"})]),
+        LLMResult(content="", tool_calls=[ToolCall("3", "done", {"answer": "a3"})]),
+    )
+    agent = SingleAgent(cfg, llm=scripted_llm)
+
+    async def main():
+        events: list[dict] = []
+
+        async def cb(ev):
+            events.append(ev)
+
+        agent.on_event(cb)
+
+        async def submit_and_wait(text: str) -> str:
+            tid = await agent.submit(text, kind="short")
+            for _ in range(100):
+                hit = [e for e in events if e.get("task_id") == tid]
+                if hit:
+                    return hit[0]["answer"]
+                await asyncio.sleep(0.02)
+            raise TimeoutError(f"no task_done for {tid}")
+
+        async with agent:
+            assert await submit_and_wait("q1") == "a1"
+        # 旧实现: 重启后 short worker 立即退出,q2 永远等不到 task_done
+        async with agent:
+            assert await submit_and_wait("q2") == "a2"
+            assert await agent.run_short("q3") == "a3"
+
+    asyncio.run(main())

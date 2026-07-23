@@ -15,7 +15,7 @@
 - **可插拔 Tools**:`Tool` 基类 + `ToolRegistry`,内置 `read_file / write_file / run_shell / done` 四个工具,支持沙箱(防 `../` 越界)。
 - **可插拔 Memory**: `Memory` + `EventLogger`,本地 jsonl + 异步事件回调 + system overlay 热更新。
 - **零强外部依赖**:仅需 `httpx`(LLM HTTP);不依赖 `shared/protocol.py` / WebSocket / Server,可在任意进程内运行。
-- **充分测试**:95 个 pytest 用例覆盖各组件 happy path + 异常 + 边界 + 并发。
+- **充分测试**:105 个 pytest 用例覆盖各组件 happy path + 异常 + 边界 + 并发。
 
 ---
 
@@ -325,7 +325,8 @@ class SingleAgent:
 
 **保留的设计**:
 - Claude Code 风格多轮 LLM + 工具循环(`ToolLoop`)
-- 长业务单槽 + 短业务 FIFO + LLM semaphore(`TaskQueue`)
+- 长业务单槽 + 短业务 FIFO(`TaskQueue`)+ LLM 调用按次串行化(`ToolLoop.llm_semaphore`,
+  短任务可在长任务的工具执行间隙穿插)
 - 防 `../` 越界的文件沙箱(`_safe_under`)
 - system overlay 追加到 system prompt 的机制(`ToolLoop.set_system_overlay`)
 - 协议无关的 LLMResult / ToolCall 表示(`LLMAdapter`)
@@ -350,16 +351,16 @@ python3 -m pytest tests/ -v
 | 文件 | 测试数 | 范围 |
 |---|---|---|
 | `test_config.py` | 7 | 构造、dict/yaml 加载、缺失依赖 |
-| `test_llm_adapter.py` | 20 | OpenAI/Anthropic payload 构造 + 解析、协议分发、错误注入、子类化 |
-| `test_tools.py` | 19 | registry、内置 4 工具、越界防护、Protocol duck-type |
-| `test_tool_loop.py` | 12 | 长/短业务主循环、done/无 tool_calls/max_steps、overlay、on_log |
-| `test_task_queue.py` | 7 | 长单槽、短 FIFO、错误状态、cancel cleanup |
-| `test_memory.py` | 11 | Memory 状态切换、EventLogger 落盘/emit/截断/异常隔离 |
-| `test_agent.py` | 19 | SingleAgent 生命周期、submit/on_event、动态工具、热更新 overlay、错误处理 |
-| **合计** | **95** | |
+| `test_llm_adapter.py` | 21 | OpenAI/Anthropic payload 构造 + 解析、协议分发、错误注入、子类化、后端路径注入 |
+| `test_tools.py` | 21 | registry、内置 4 工具、越界防护、大文件部分读取、超时杀进程组、Protocol duck-type |
+| `test_tool_loop.py` | 13 | 长/短业务主循环、done/无 tool_calls/max_steps、overlay、on_log、LLM 调用串行化 |
+| `test_task_queue.py` | 9 | 长单槽、短 FIFO、错误状态、cancel cleanup、重启、慢回调不阻塞 |
+| `test_memory.py` | 13 | Memory 状态切换、EventLogger 落盘/emit/截断/异常隔离、队列满丢弃、重启 |
+| `test_agent.py` | 21 | SingleAgent 生命周期、submit/on_event、动态工具、热更新 overlay、错误处理、短任务穿插、重启 |
+| **合计** | **105** | |
 
 测试用 `ScriptedLLM`(可编程 LLM,conftest 提供)避免真实 HTTP 调用,
-执行时间约 6 秒。
+执行时间约 4 秒。
 
 ---
 

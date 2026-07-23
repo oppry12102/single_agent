@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -182,11 +184,15 @@ class ReadFileTool(Tool):
         if not target.is_file():
             return {"error": f"not a file: {rel}"}
         try:
-            data = target.read_bytes()[:max_bytes]
+            # 只读前 max_bytes(而不是 read_bytes() 全量读入再切片,
+            # 避免 workspace 里的大文件直接把内存吃爆)
+            with open(target, "rb") as f:
+                data = f.read(max_bytes)
             return {
                 "path": rel,
                 "content": data.decode("utf-8", errors="replace"),
                 "bytes": len(data),
+                "truncated": target.stat().st_size > len(data),
             }
         except Exception as exc:
             return {"error": f"{type(exc).__name__}: {exc}"}
@@ -265,13 +271,19 @@ class RunShellTool(Tool):
                 cwd=str(ctx.workspace),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                # 独立进程组: 超时时能整组杀掉(proc.kill 只杀 shell,
+                # 后台子进程会变孤儿残留)
+                start_new_session=True,
             )
             try:
                 stdout, _ = await asyncio.wait_for(
                     proc.communicate(), timeout=timeout_s,
                 )
             except asyncio.TimeoutError:
-                proc.kill()
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    proc.kill()
                 await proc.wait()
                 return {"error": f"timeout after {timeout_s}s", "cmd": cmd}
             out_bytes = stdout[: self.MAX_OUTPUT_BYTES]

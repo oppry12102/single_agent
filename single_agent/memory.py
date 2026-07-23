@@ -60,6 +60,7 @@ class EventLogger:
 
     # ----------------------------------------------------------- lifecycle
     def start(self) -> None:
+        self._stop = False  # 支持 stop() 后重新 start()
         if self._task is None:
             self._task = asyncio.create_task(self._worker())
 
@@ -99,7 +100,9 @@ class EventLogger:
             except Exception as exc:
                 log.warning("local log write failed: %s", exc)
         try:
-            await self._queue.put(entry)
+            # put_nowait: 队列满时丢弃而不是阻塞调用方
+            # (await put 在满队列上会永远挂起,QueueFull 只有 put_nowait 才抛)
+            self._queue.put_nowait(entry)
         except asyncio.QueueFull:
             log.warning("event queue full, dropping kind=%s", kind)
 

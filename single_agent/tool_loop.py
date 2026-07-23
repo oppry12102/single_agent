@@ -7,6 +7,8 @@ messages = [system, user, assistant(tool_calls), tool, assistant, tool, ...]
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 from typing import Any, Awaitable, Callable
@@ -37,6 +39,7 @@ class ToolLoop:
         system_short: str = SYSTEM_SHORT,
         system_overlay: str = "",
         on_log: LogCallback | None = None,
+        llm_semaphore: asyncio.Semaphore | None = None,
     ):
         self.llm = llm
         self.tools = tools
@@ -45,6 +48,17 @@ class ToolLoop:
         self.system_short = system_short
         self.system_overlay = system_overlay
         self.on_log = on_log
+        # 按次串行化 LLM 调用(防自并发限流);只在单次 chat 期间持有,
+        # 工具执行阶段释放,短任务得以在长任务的间隙穿插。
+        self.llm_semaphore = llm_semaphore
+
+    @contextlib.asynccontextmanager
+    async def _llm_gate(self):
+        if self.llm_semaphore is None:
+            yield
+        else:
+            async with self.llm_semaphore:
+                yield
 
     # ----------------------------------------------------------- overlay
     def set_system_overlay(self, overlay: str) -> None:
@@ -66,9 +80,10 @@ class ToolLoop:
         await self._log("state_change", "internal", "long task start", task_id)
         for step in range(self.max_steps):
             try:
-                resp = await self.llm.chat_with_tools(
-                    messages, tools=self.tools.specs(short_mode=False),
-                )
+                async with self._llm_gate():
+                    resp = await self.llm.chat_with_tools(
+                        messages, tools=self.tools.specs(short_mode=False),
+                    )
             except LLMCallError as exc:
                 await self._log("llm_call", "internal", f"error: {exc}", task_id)
                 return f"[LLM error: {exc}]"
@@ -121,9 +136,10 @@ class ToolLoop:
         ]
         await self._log("state_change", "internal", "short task start", task_id)
         try:
-            resp = await self.llm.chat_with_tools(
-                messages, tools=self.tools.specs(short_mode=True),
-            )
+            async with self._llm_gate():
+                resp = await self.llm.chat_with_tools(
+                    messages, tools=self.tools.specs(short_mode=True),
+                )
         except LLMCallError as exc:
             await self._log("llm_call", "internal", f"error: {exc}", task_id)
             return f"[LLM error: {exc}]"

@@ -98,6 +98,9 @@ class SingleAgent:
         sys_long = config.system_long or DEFAULT_SYSTEM_LONG
         sys_short = config.system_short or DEFAULT_SYSTEM_SHORT
 
+        # LLM 调用串行化(防自并发限流);queue 任务与 inline run 共用
+        llm_sem = asyncio.Semaphore(1)
+
         self.loop = ToolLoop(
             self.llm, self.tools,
             max_steps=config.max_steps,
@@ -105,12 +108,12 @@ class SingleAgent:
             system_short=sys_short,
             system_overlay=self.memory.overlay,
             on_log=self._on_loop_log,
+            llm_semaphore=llm_sem,
         )
 
         self.queue = TaskQueue(
             long_runner=self._run_long,
             short_runner=self._run_short,
-            llm_semaphore=asyncio.Semaphore(1),
         )
         self.queue.on_task_done(self._on_task_done)
 

@@ -257,3 +257,34 @@ def test_close_safe_with_no_backend():
     a = LLMAdapter(provider="", api_format="openai")
     a.close()  # 不应抛
     assert a._backend_client is None
+
+
+# ============================================================
+# 回归: 无 PYTHONPATH 时后端路径注入必须生效
+# (bug: 注入的是 tools/agent 和 tools/agent/llm,无法 import llm 包)
+# ============================================================
+
+
+def test_backend_sys_path_injection(monkeypatch):
+    import sys
+
+    import single_agent.llm_adapter as la
+
+    agent_root = Path(la.__file__).resolve().parents[1]  # <tools>/agent
+    tools_root = Path(la.__file__).resolve().parents[2]  # <tools>
+    if not (tools_root / "llm" / "llm" / "__init__.py").is_file():
+        pytest.skip("tools/llm 项目不存在,跳过")
+
+    # 模拟没有 PYTHONPATH 的干净环境
+    monkeypatch.setattr(
+        sys, "path",
+        [p for p in sys.path if p not in (str(agent_root), str(tools_root))],
+    )
+    for mod in [m for m in sys.modules if m == "llm" or m.startswith("llm.")]:
+        monkeypatch.delitem(sys.modules, mod, raising=False)
+
+    # provider 不存在会在 client init 阶段失败(被捕获),
+    # 但 `from llm import ...` 这一步必须成功
+    LLMAdapter(provider="nonexistent-provider")
+    assert "llm" in sys.modules
+    assert hasattr(sys.modules["llm"], "LLMClient")

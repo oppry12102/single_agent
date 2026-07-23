@@ -169,3 +169,52 @@ def test_event_logger_stop_without_start(tmp_path: Path):
         await el.stop()  # 不应抛
 
     asyncio.run(main())
+
+
+# ============================================================
+# 回归: 队列满时丢弃而不是阻塞(bug: await put 会永远挂起)
+# ============================================================
+
+
+def test_event_logger_queue_full_drops_not_blocks(tmp_path: Path):
+    el = EventLogger(agent_id="a", log_file=None, queue_maxsize=2)
+
+    async def main():
+        # 不 start,worker 不消费,队列必然被塞满;
+        # 旧实现在第 3 条就会永远挂起
+        for _ in range(10):
+            await asyncio.wait_for(el.log("k", "p", "s"), timeout=0.5)
+        # 队列保持满,多余的被丢弃
+        assert el._queue.qsize() == 2
+
+    asyncio.run(main())  # 不 hang 即通过(wait_for 超时则抛)
+
+
+# ============================================================
+# 回归: stop 后重新 start 必须恢复工作(bug: _stop 不重置)
+# ============================================================
+
+
+def test_event_logger_restart_after_stop(tmp_path: Path):
+    received: list[dict] = []
+
+    async def emit(entry):
+        received.append(entry)
+
+    el = EventLogger(agent_id="a", log_file=None)
+    el.set_emit(emit)
+
+    async def main():
+        el.start()
+        await el.stop()
+        el.start()  # 重启;旧实现 worker 进循环立即退出,事件静默丢失
+        await el.log("k", "p", "after-restart")
+        for _ in range(100):
+            if received:
+                break
+            await asyncio.sleep(0.02)
+        await el.stop()
+
+    asyncio.run(main())
+    assert len(received) == 1
+    assert received[0]["snippet"] == "after-restart"

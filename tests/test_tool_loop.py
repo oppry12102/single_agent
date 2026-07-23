@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from single_agent import LLMResult, ToolCall
+from single_agent import LLMAdapter, LLMResult, ToolCall
 from single_agent.tool_loop import ToolLoop
 from single_agent.tools import ToolContext, build_default_registry
 
@@ -236,3 +236,42 @@ def test_on_log_callback_exception_does_not_crash(cfg):
     lp = ToolLoop(scripted, tools, max_steps=3, on_log=bad_cb)
     r = asyncio.run(lp.run_long_task("t12", "hi"))
     assert r == "ok"  # 回调失败不应影响主流程
+
+
+# ============================================================
+# 回归: llm_semaphore 按次串行化 LLM 调用(而不是整个任务)
+# ============================================================
+
+
+def test_llm_semaphore_serializes_single_calls(cfg):
+    """共享 sem 时并发 peak=1;不传 sem 时 peak=2(调用可重叠)。"""
+
+    async def run_pair(sem) -> int:
+        in_call = 0
+        peak = 0
+
+        class SlowLLM(LLMAdapter):
+            def __init__(self):
+                super().__init__(provider="")
+
+            async def chat_with_tools(self, messages, *, tools=None, **kw):
+                nonlocal in_call, peak
+                in_call += 1
+                peak = max(peak, in_call)
+                await asyncio.sleep(0.05)
+                in_call -= 1
+                return LLMResult(content="", tool_calls=[
+                    ToolCall("1", "done", {"answer": "a"}),
+                ])
+
+        ctx = ToolContext(workspace=cfg.workspace, agent_id=cfg.agent_id)
+        tools = build_default_registry(ctx)
+        lp = ToolLoop(SlowLLM(), tools, llm_semaphore=sem)
+        await asyncio.gather(
+            lp.run_long_task("t1", "x"),
+            lp.run_short_task("t2", "y"),
+        )
+        return peak
+
+    assert asyncio.run(run_pair(asyncio.Semaphore(1))) == 1
+    assert asyncio.run(run_pair(None)) == 2

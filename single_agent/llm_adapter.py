@@ -91,11 +91,18 @@ class LLMAdapter:
     # ------------------------------------------------------------------
     def _init_backend(self, provider: str, timeout: float, model: str) -> None:
         try:
-            # tools/llm 包路径注入: 假定 tools 与本包同级或可被 import
+            # tools/llm 包路径注入。两种布局都兼容:
+            #   <tools>/llm/llm/__init__.py   (llm 是项目目录,内含同名包)
+            #   <tools>/llm/__init__.py       (llm 包直接在 tools 下)
+            # 只插入真正含 llm 包的目录——否则 namespace package 会把
+            # sys.modules['llm'] 污染成空壳,后续正确路径也救不回来。
             _here = os.path.dirname(os.path.abspath(__file__))
-            for cand in (os.path.dirname(_here), os.path.dirname(_here) + "/llm"):
-                if os.path.isdir(cand) and cand not in sys.path:
-                    sys.path.insert(0, cand)
+            _tools_root = os.path.dirname(os.path.dirname(_here))
+            for cand in (os.path.join(_tools_root, "llm"), _tools_root):
+                if os.path.isfile(os.path.join(cand, "llm", "__init__.py")):
+                    if cand not in sys.path:
+                        sys.path.insert(0, cand)
+                    break
             from llm import LLMClient  # type: ignore
             from llm.providers import PROVIDERS  # type: ignore
         except Exception as exc:  # pragma: no cover - 缺包时由调用方注入

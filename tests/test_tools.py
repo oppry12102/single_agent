@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -198,3 +199,59 @@ def test_default_registry_has_four_tools(tmp_path: Path):
     reg = build_default_registry(ctx)
     names = set(reg.names())
     assert {"read_file", "write_file", "run_shell", "done"} <= names
+
+
+# ============================================================
+# 回归: read_file 只读前 max_bytes,不全量入内存(bug: read_bytes()[:n])
+# ============================================================
+
+
+def test_read_file_partial_read(tmp_path: Path, monkeypatch):
+    (tmp_path / "big.txt").write_text("x" * 10000)
+    ctx = ToolContext(workspace=tmp_path, agent_id="a")
+    reg = build_default_registry(ctx)
+
+    # 旧实现走 read_bytes() 全量读入;直接禁掉这个入口
+    def _no_full_read(self, *a, **kw):
+        raise AssertionError("read_bytes() called — 应流式部分读取")
+
+    monkeypatch.setattr(Path, "read_bytes", _no_full_read)
+
+    r = asyncio.run(reg.execute("read_file", {"path": "big.txt", "max_bytes": 100}))
+    assert r["bytes"] == 100
+    assert r["content"] == "x" * 100
+    assert r["truncated"] is True
+
+    r2 = asyncio.run(reg.execute("read_file", {"path": "big.txt", "max_bytes": 20000}))
+    assert r2["bytes"] == 10000
+    assert r2["truncated"] is False
+
+
+# ============================================================
+# 回归: run_shell 超时杀掉整个进程组(bug: proc.kill 只杀 shell)
+# ============================================================
+
+
+def test_run_shell_timeout_kills_process_group(tmp_path: Path):
+    ctx = ToolContext(workspace=tmp_path, agent_id="a")
+    reg = build_default_registry(ctx)
+
+    async def main():
+        # 旧实现只杀 shell: sleep 子进程残留并持有 stdout 管道,
+        # execute 会一直挂到子进程自然退出(60s);修复后整组杀掉,~1s 返回
+        r = await asyncio.wait_for(reg.execute("run_shell", {
+            "cmd": "sleep 60 & echo $! > child.pid; wait",
+            "timeout_s": 1,
+        }), timeout=10)
+        assert "timeout" in r["error"]
+        child_pid = int((tmp_path / "child.pid").read_text().strip())
+        # killpg 后子进程应很快消失(可能短暂 zombie,轮询确认)
+        for _ in range(100):
+            try:
+                os.kill(child_pid, 0)
+            except ProcessLookupError:
+                return
+            await asyncio.sleep(0.02)
+        pytest.fail(f"child process {child_pid} still alive after timeout kill")
+
+    asyncio.run(main())

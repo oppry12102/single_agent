@@ -27,7 +27,6 @@ def make_queue(long_runner=None, short_runner=None):
     return TaskQueue(
         long_runner=long_runner or default_long,
         short_runner=short_runner or default_short,
-        llm_semaphore=asyncio.Semaphore(1),
     )
 
 
@@ -214,3 +213,66 @@ def test_submit_after_start():
         await q.stop()
 
     asyncio.run(main())
+
+
+# ============================================================
+# 回归: stop 后重新 start,worker 必须恢复消费(bug: _stop 不重置)
+# ============================================================
+
+
+def test_queue_restart_after_stop():
+    async def main():
+        results = []
+
+        async def on_done(item, answer, status):
+            results.append((item.task_id, answer, status))
+
+        q = make_queue()
+        q.on_task_done(on_done)
+        q.start()
+        await q.stop()
+        q.start()  # 重启;旧实现 short worker 进循环立即退出,任务静默丢失
+        await q.submit(TaskItem(task_id="r", text="x", kind="short"))
+        for _ in range(100):
+            if results:
+                break
+            await asyncio.sleep(0.02)
+        await q.stop()
+        assert results == [("r", "short:x", "ok")]
+
+    asyncio.run(main())
+
+
+# ============================================================
+# 回归: on_task_done 回调在锁外执行,慢订阅者不阻塞下一个 long
+# ============================================================
+
+
+def test_slow_done_callback_does_not_block_next_long():
+    events: list[tuple[str, str]] = []
+
+    async def runner(item: TaskItem) -> str:
+        events.append(("run", item.task_id))
+        return item.task_id
+
+    async def slow_done(item, answer, status):
+        events.append(("cb-start", item.task_id))
+        await asyncio.sleep(0.15)
+        events.append(("cb-end", item.task_id))
+
+    async def main():
+        q = make_queue(long_runner=runner)
+        q.on_task_done(slow_done)
+        q.start()
+        await q.submit(TaskItem(task_id="a", text="", kind="long"))
+        await q.submit(TaskItem(task_id="b", text="", kind="long"))
+        for _ in range(200):
+            if sum(1 for e in events if e[0] == "cb-end") >= 2:
+                break
+            await asyncio.sleep(0.02)
+        await q.stop()
+
+    asyncio.run(main())
+    # 旧实现 _finish 在 long_in_flight 锁内: b 的 runner 要等 a 的回调结束
+    # 才能跑;修复后 b 在 a 的慢回调期间就已执行
+    assert events.index(("run", "b")) < events.index(("cb-end", "a"))
